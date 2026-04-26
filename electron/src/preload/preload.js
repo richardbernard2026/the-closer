@@ -12,4 +12,5 @@ contextBridge.exposeInMainWorld('closer', {
   onAudioLevel: (cb) => ipcRenderer.on('audio-level', (_, level) => cb(level)),
   onBridgeStatus: (cb) => ipcRenderer.on('bridge-status', (_, status) => cb(status)),
   onToggleListening: (cb) => ipcRenderer.on('toggle-listening', (_, isListening) => cb(isListening)),
+  onAudioBinary: (cb) => ipcRenderer.on('audio-binary', (_, buf) => cb(buf)),
 })

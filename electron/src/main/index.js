@@ -23,7 +23,7 @@ function createWindow() {
     skipTaskbar: true,
     hasShadow: false,
     webPreferences: {
-      preload: path.join(__dirname, '../../preload/preload.js'),
+      preload: path.join(__dirname, '../preload/preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
     },
@@ -50,7 +50,11 @@ function connectWebSocket() {
     if (mainWindow) mainWindow.webContents.send('bridge-status', { connected: true })
   })
 
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
+    if (isBinary) {
+      if (mainWindow) mainWindow.webContents.send('audio-binary', data)
+      return
+    }
     try {
       const msg = JSON.parse(data.toString())
       if (!mainWindow) return
@@ -59,8 +63,8 @@ function connectWebSocket() {
         case 'transcript':
           mainWindow.webContents.send('transcript-update', msg.text)
           break
-        case 'suggestion':
-          mainWindow.webContents.send('suggestion-update', msg.bullets)
+        case 'suggestions':
+          mainWindow.webContents.send('suggestion-update', msg.items)
           break
         case 'audio-level':
           mainWindow.webContents.send('audio-level', msg.level)

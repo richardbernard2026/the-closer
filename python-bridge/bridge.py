@@ -1,35 +1,34 @@
 import asyncio
+import io
 import json
 import os
-import tempfile
 import wave
-from pathlib import Path
+from collections import deque
 
 from dotenv import load_dotenv
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
 import sounddevice as sd
-import openai
+import groq
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-if not OPENAI_API_KEY:
-    print('[warn] OPENAI_API_KEY is not set. AI features disabled until key is added to python-bridge/.env', flush=True)
+GROQ_API_KEY = os.getenv('GROQ_API_KEY')
+ai_enabled = bool(GROQ_API_KEY)
+if not ai_enabled:
+    print('[warn] GROQ_API_KEY is not set. AI features disabled until key is added to python-bridge/.env', flush=True)
 
-client = openai.OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+client = groq.Groq(api_key=GROQ_API_KEY) if ai_enabled else None
 
 SAMPLE_RATE = 16000
-CHUNK_SECONDS = 5
+CHUNK_SECONDS = 3
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
 
 SYSTEM_PROMPT = (
-    'You are an expert interview coach listening to a live conversation. '
-    'Given the transcript snippet, output 1-3 short coaching phrases (3-5 words each) '
-    'that the interviewer could use next. Focus on: probing deeper, active listening, '
-    'or transitioning topics. Respond with raw JSON only: '
-    '{"bullets": ["phrase 1", "phrase 2"]}'
+    'You are a real-time interview coach. Given this transcript snippet, '
+    'reply with exactly 3 short trigger phrases (5 words max each) the speaker '
+    'should say next. Return only a JSON array of 3 strings. No explanation.'
 )
 
 app = FastAPI()
@@ -37,6 +36,7 @@ app = FastAPI()
 capturing = False
 audio_buffer: list[float] = []
 connected_clients: list[WebSocket] = []
+transcript_buffer: deque[str] = deque(maxlen=20)  # 20 × 3s ≈ 60s rolling window
 
 
 async def broadcast(msg: dict):
@@ -46,6 +46,25 @@ async def broadcast(msg: dict):
             await ws.send_text(data)
         except Exception:
             pass
+
+
+async def broadcast_bytes(data: bytes):
+    for ws in list(connected_clients):
+        try:
+            await ws.send_bytes(data)
+        except Exception:
+            pass
+
+
+def encode_wav(samples: 'np.ndarray') -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+        wf.writeframes(pcm.tobytes())
+    return buf.getvalue()
 
 
 def find_loopback_device():
@@ -66,63 +85,51 @@ async def process_chunk(chunk: list[float]):
 
     rms = float(np.sqrt(np.mean(samples ** 2)))
     await broadcast({'type': 'audio-level', 'level': min(rms * 5, 1.0)})
+    wav_bytes = encode_wav(samples)
+    await broadcast_bytes(wav_bytes)
 
     if not client:
         return
 
-    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
-        tmp_path = f.name
+    loop = asyncio.get_event_loop()
 
     try:
-        with wave.open(tmp_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
-            wf.writeframes(pcm.tobytes())
-
-        loop = asyncio.get_event_loop()
-
-        with open(tmp_path, 'rb') as f:
-            transcript_text = await loop.run_in_executor(
-                None,
-                lambda: client.audio.transcriptions.create(
-                    model='whisper-1',
-                    file=f,
-                    response_format='text',
-                ),
-            )
-
-        text = str(transcript_text).strip()
-        if not text:
-            return
-
-        await broadcast({'type': 'transcript', 'text': text})
-
-        suggestion_resp = await loop.run_in_executor(
+        transcript_resp = await loop.run_in_executor(
             None,
-            lambda: client.chat.completions.create(
-                model='gpt-4o',
-                messages=[
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': text},
-                ],
-                temperature=0.4,
-                max_tokens=120,
-                response_format={'type': 'json_object'},
+            lambda: client.audio.transcriptions.create(
+                model='whisper-large-v3',
+                file=('audio.wav', wav_bytes),
             ),
         )
 
-        raw = suggestion_resp.choices[0].message.content
-        data = json.loads(raw)
-        bullets = data.get('bullets', [])[:3]
-        if bullets:
-            await broadcast({'type': 'suggestion', 'bullets': bullets})
+        text = transcript_resp.text.strip()
+        if not text:
+            return
+
+        transcript_buffer.append(text)
+        await broadcast({'type': 'transcript', 'text': text})
+
+        rolling_text = ' '.join(transcript_buffer)
+        suggestion_resp = await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model='llama-3.1-8b-instant',
+                messages=[
+                    {'role': 'system', 'content': SYSTEM_PROMPT},
+                    {'role': 'user', 'content': rolling_text},
+                ],
+                temperature=0.4,
+                max_tokens=120,
+            ),
+        )
+
+        raw = suggestion_resp.choices[0].message.content.strip()
+        items = json.loads(raw)
+        if isinstance(items, list) and items:
+            await broadcast({'type': 'suggestions', 'items': items[:3]})
 
     except Exception as e:
         print(f'[error] Chunk processing failed: {e}', flush=True)
-    finally:
-        Path(tmp_path).unlink(missing_ok=True)
 
 
 @app.websocket('/')

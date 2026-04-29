@@ -2,8 +2,11 @@ import asyncio
 import io
 import json
 import os
+import time
 import wave
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 from dotenv import load_dotenv
 import numpy as np
@@ -26,17 +29,33 @@ CHUNK_SECONDS = 3
 CHUNK_SAMPLES = SAMPLE_RATE * CHUNK_SECONDS
 
 SYSTEM_PROMPT = (
-    'You are a real-time interview coach. Given this transcript snippet, '
-    'reply with exactly 3 short trigger phrases (5 words max each) the speaker '
-    'should say next. Return only a JSON array of 3 strings. No explanation.'
+    'You are a real-time interview coach listening to a live conversation. '
+    'Your job is to suggest what the USER (the person being interviewed or in the meeting) '
+    'should say NEXT to move the conversation forward. '
+    'Do not answer questions on their behalf. '
+    'Do not summarize what was said. '
+    'Suggest 3 short follow-up phrases (5 words max each) that would be natural, '
+    'confident, and strategic for the user to say out loud right now. '
+    'Return only a JSON array of 3 strings. No explanation. No preamble.'
 )
 
+_transcript_dir = Path(__file__).parent / 'transcripts'
+try:
+    _transcript_dir.mkdir(exist_ok=True)
+    _transcript_file = _transcript_dir / f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+except Exception as e:
+    print(f'[warn] Could not create transcripts directory: {e}', flush=True)
+    _transcript_file = None
+
 app = FastAPI()
+
+SUGGESTION_COOLDOWN = 7  # seconds between LLM calls — tunable
 
 capturing = False
 audio_buffer: list[float] = []
 connected_clients: list[WebSocket] = []
 transcript_buffer: deque[str] = deque(maxlen=20)  # 20 × 3s ≈ 60s rolling window
+last_suggestion_time: float = 0
 
 
 async def broadcast(msg: dict):
@@ -109,24 +128,34 @@ async def process_chunk(chunk: list[float]):
         transcript_buffer.append(text)
         await broadcast({'type': 'transcript', 'text': text})
 
-        rolling_text = ' '.join(transcript_buffer)
-        suggestion_resp = await loop.run_in_executor(
-            None,
-            lambda: client.chat.completions.create(
-                model='llama-3.1-8b-instant',
-                messages=[
-                    {'role': 'system', 'content': SYSTEM_PROMPT},
-                    {'role': 'user', 'content': rolling_text},
-                ],
-                temperature=0.4,
-                max_tokens=120,
-            ),
-        )
+        if _transcript_file:
+            try:
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                _transcript_file.open('a').write(f'[{timestamp}] {text}\n')
+            except Exception as e:
+                print(f'[warn] Transcript write failed: {e}', flush=True)
 
-        raw = suggestion_resp.choices[0].message.content.strip()
-        items = json.loads(raw)
-        if isinstance(items, list) and items:
-            await broadcast({'type': 'suggestions', 'items': items[:3]})
+        if time.time() - last_suggestion_time >= SUGGESTION_COOLDOWN:
+            global last_suggestion_time
+            rolling_text = ' '.join(transcript_buffer)
+            suggestion_resp = await loop.run_in_executor(
+                None,
+                lambda: client.chat.completions.create(
+                    model='llama-3.1-8b-instant',
+                    messages=[
+                        {'role': 'system', 'content': SYSTEM_PROMPT},
+                        {'role': 'user', 'content': rolling_text},
+                    ],
+                    temperature=0.4,
+                    max_tokens=120,
+                ),
+            )
+
+            raw = suggestion_resp.choices[0].message.content.strip()
+            items = json.loads(raw)
+            if isinstance(items, list) and items:
+                await broadcast({'type': 'suggestions', 'items': items[:3]})
+                last_suggestion_time = time.time()
 
     except Exception as e:
         print(f'[error] Chunk processing failed: {e}', flush=True)
